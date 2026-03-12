@@ -9,7 +9,7 @@
  *
  * It:
  *   - Reads from screen:frames (Redis Stream)
- *   - Proposes an embedding approach using Claude
+ *   - Proposes an embedding approach using the local model
  *   - Reads the current refined approach from Redis (from the refiner)
  *   - Publishes results to screen:approaches
  *   - Answers all six questions via getStatus()
@@ -197,11 +197,12 @@ class SwarmStatusReader
             $name    = $payload['agent'] ?? 'unknown';
             if (!isset($agents[$name])) {
                 $agents[$name] = [
-                    'last_seen'   => $payload['timestamp'] ?? '',
-                    'score'       => $payload['score'] ?? 0,
-                    'task'        => $payload['what'] ?? '',
-                    'what_worked' => $payload['what_worked'] ?? '',
-                    'help_needed' => $payload['help_needed'] ?? '',
+                    'last_seen'    => $payload['timestamp'] ?? '',
+                    'score'        => $payload['score'] ?? 0,
+                    'task'         => $payload['what'] ?? '',
+                    'top_positive' => $payload['topPositive'] ?? '',
+                    'top_negative' => $payload['topNegative'] ?? '',
+                    'help_needed'  => $payload['helpNeeded'] ?? '',
                 ];
             }
         }
@@ -216,10 +217,10 @@ class SwarmStatusReader
             $payload  = json_decode($data['data'], true);
             $score    = $payload['payload']['score'] ?? [];
             $scores[] = [
-                'ts'      => $payload['timestamp'] ?? '',
-                'overall' => $score['overall'] ?? 0,
-                'worked'  => $score['what_worked'] ?? '',
-                'didnt'   => $score['what_didnt'] ?? '',
+                'ts'           => $payload['timestamp'] ?? '',
+                'overall'      => $score['overall'] ?? 0,
+                'top_positive' => $score['top_positive'] ?? '',
+                'top_negative' => $score['top_negative'] ?? '',
             ];
         }
         return array_reverse($scores);

@@ -5,7 +5,7 @@
  *
  * Exact same contract as the Python agent:
  * - get_status() answers the six questions
- * - add_to_memory() stores scored results
+ * - add_to_memory() stores scored results (two-pass impact items)
  * - build_system_prompt() injects history
  * - act() calls the local model with the built prompt
  *
@@ -22,34 +22,64 @@ const OLLAMA_MODEL    = process.env.OLLAMA_MODEL ?? "qwen3.5:latest";
 
 // ── Types ─────────────────────────────────────────────────────────
 
-interface AgentStatus {
-  agent:        string;
-  what:         string;   // What are you doing?
-  goal:         string;   // What's your goal?
-  why:          string;   // Why?
-  how:          string;   // How?
-  score:        number;   // Last score 0-1
-  what_worked:  string;   // what's working + strongest parts + what to keep
-  what_didnt:   string;   // what's not working + weakest parts + what to change
-  what_missing: string;   // what should have been included but wasn't
-  help_needed:  string;   // How can I help?
-  timestamp:    string;
+interface ImpactItem {
+  dimension:   string;
+  observation: string;
+  impact:      number;   // +5, +3, +2, +1, -1, -2, -3, -5
+}
+
+interface DerivedScore {
+  overall:            number;
+  net_impact:         number;
+  total_items:        number;
+  normalized_impact:  number;
+  raw_score:          number;
 }
 
 interface ScoreResult {
-  overall:      number;
-  what_worked:  string;
-  what_didnt:   string;
-  what_missing: string;
+  items:    ImpactItem[];
+  derived?: DerivedScore;    // optional — will be computed if missing
+}
+
+interface AgentStatus {
+  agent:         string;
+  what:          string;
+  goal:          string;
+  why:           string;
+  how:           string;
+  score:         number;
+  top_positive:  string;
+  top_negative:  string;
+  help_needed:   string;
+  timestamp:     string;
 }
 
 interface MemoryEntry {
-  task:         string;
-  result:       string;
-  score:        number;
-  what_worked:  string;
-  what_didnt:   string;
-  what_missing: string;
+  task:          string;
+  result:        string;
+  score:         number;
+  top_positive:  string;
+  top_negative:  string;
+  impact_items:  ImpactItem[];
+}
+
+// ── Two-Pass Scoring ────────────────────────────────────────────
+// Pass 1 (LLM): itemize observations with +/- impact scores
+// Pass 2 (math): net_impact / √(items) → normalized 0-1 score
+
+function deriveScore(items: ImpactItem[]): DerivedScore {
+  if (items.length === 0) {
+    return { overall: 0.5, net_impact: 0, total_items: 0,
+             normalized_impact: 0, raw_score: 50 };
+  }
+  const netImpact = items.reduce((sum, i) => sum + i.impact, 0);
+  const totalItems = items.length;
+  const normalizedImpact = netImpact / Math.sqrt(totalItems);
+  const rawScore = Math.max(0, Math.min(100, 50 + normalizedImpact * 8.0));
+  const overall = Math.round((rawScore / 100) * 1000) / 1000;
+  return { overall, net_impact: netImpact, total_items: totalItems,
+           normalized_impact: Math.round(normalizedImpact * 1000) / 1000,
+           raw_score: Math.round(rawScore * 10) / 10 };
 }
 
 // ── Ollama Client ────────────────────────────────────────────────
@@ -115,9 +145,8 @@ class Agent {
   private reasoning    = "";
   private approach     = "";
   private lastScore    = 0;
-  private whatWorked   = "";
-  private whatDidnt    = "";
-  private whatMissing  = "";
+  private topPositive  = "";
+  private topNegative  = "";
 
   constructor(
     private name: string,
@@ -129,37 +158,42 @@ class Agent {
 
   getStatus(): AgentStatus {
     return {
-      agent:        this.name,
-      what:         this.currentTask,
-      goal:         this.goal,
-      why:          this.reasoning,
-      how:          this.approach,
-      score:        this.lastScore,
-      what_worked:  this.whatWorked,
-      what_didnt:   this.whatDidnt,
-      what_missing: this.whatMissing,
-      help_needed:  this.assessHelp(),
-      timestamp:    new Date().toISOString(),
+      agent:         this.name,
+      what:          this.currentTask,
+      goal:          this.goal,
+      why:           this.reasoning,
+      how:           this.approach,
+      score:         this.lastScore,
+      top_positive:  this.topPositive,
+      top_negative:  this.topNegative,
+      help_needed:   this.assessHelp(),
+      timestamp:     new Date().toISOString(),
     };
   }
 
   private assessHelp(): string {
     if (this.lastScore === 0) return "No score yet — just getting started";
-    if (this.lastScore < 0.4) return `Struggling (${this.lastScore.toFixed(2)}) — need different approach for: ${this.whatDidnt}`;
-    if (this.lastScore < 0.7) return `Progress (${this.lastScore.toFixed(2)}) — could improve: ${this.whatMissing}`;
+    if (this.lastScore < 0.4) return `Struggling (${this.lastScore.toFixed(2)}) — top issue: ${this.topNegative}`;
+    if (this.lastScore < 0.7) return `Progress (${this.lastScore.toFixed(2)}) — working on: ${this.topNegative}`;
     return `Performing well (${this.lastScore.toFixed(2)}) — no help needed`;
   }
 
   // ── Memory ──────────────────────────────────────────────────────
 
   addToMemory(task: string, result: string, score: ScoreResult): void {
+    const items = score.items;
+    const derived = score.derived ?? deriveScore(items);
+
+    const positives = items.filter(i => i.impact > 0).sort((a, b) => b.impact - a.impact);
+    const negatives = items.filter(i => i.impact < 0).sort((a, b) => a.impact - b.impact);
+
     const entry: MemoryEntry = {
       task,
-      result:       result.slice(0, 400),
-      score:        score.overall,
-      what_worked:  score.what_worked,
-      what_didnt:   score.what_didnt,
-      what_missing: score.what_missing,
+      result:        result.slice(0, 400),
+      score:         derived.overall,
+      top_positive:  positives[0]?.observation ?? "",
+      top_negative:  negatives[0]?.observation ?? "",
+      impact_items:  items,
     };
 
     this.memory.push(entry);
@@ -167,9 +201,8 @@ class Agent {
 
     // Update live state
     this.lastScore   = entry.score;
-    this.whatWorked  = entry.what_worked;
-    this.whatDidnt   = entry.what_didnt;
-    this.whatMissing = entry.what_missing;
+    this.topPositive = entry.top_positive;
+    this.topNegative = entry.top_negative;
   }
 
   buildSystemPrompt(): string {
@@ -190,9 +223,8 @@ class Agent {
     const history = this.memory.slice(-3).map(m =>
       `Task: ${m.task.slice(0, 80)}\n` +
       `Score: ${m.score.toFixed(2)} | ` +
-      `Worked: ${m.what_worked} | ` +
-      `Didn't: ${m.what_didnt} | ` +
-      `Missing: ${m.what_missing}`
+      `Best: ${m.top_positive} | ` +
+      `Worst: ${m.top_negative}`
     ).join("\n\n");
 
     return `${base}\n\nYour recent performance — use this to improve:\n${history}`;
@@ -213,7 +245,6 @@ class Agent {
 // ── Demo ─────────────────────────────────────────────────────────
 
 async function main() {
-  // Check Ollama is running
   if (!(await ollamaIsAvailable())) {
     console.error("Ollama is not running at", OLLAMA_BASE_URL);
     console.error("Start it with: ollama serve");
@@ -227,18 +258,36 @@ async function main() {
     "Produce embedding descriptions that best capture human work intent from screen frames",
   );
 
-  const rounds = [
+  const rounds: Array<{ task: string; score: ScoreResult }> = [
     {
       task: "Describe this screen frame for embedding: Excel spreadsheet open with multiple tabs and a PDF in split screen",
-      score: { overall: 0.45, what_worked: "Identified the tools; concise", what_didnt: "Too surface-level — missed cognitive state", what_missing: "No work stage" }
+      score: { items: [
+        { dimension: "intent_capture",   observation: "Identified tools correctly",       impact: +1 },
+        { dimension: "specificity",      observation: "Concise output",                   impact: +1 },
+        { dimension: "intent_capture",   observation: "Missed cognitive state entirely",  impact: -3 },
+        { dimension: "specificity",      observation: "Just listed what's visible",       impact: -2 },
+        { dimension: "noise_resistance", observation: "No mention of work stage",         impact: -2 },
+      ]}
     },
     {
       task: "Describe this screen frame for embedding: Figma canvas with a landing page design being iterated on",
-      score: { overall: 0.68, what_worked: "Captured creative context; tool + task included", what_didnt: "Didn't infer enough about person's intent", what_missing: "Should note focused refinement state" }
+      score: { items: [
+        { dimension: "intent_capture",  observation: "Captured creative design context",     impact: +3 },
+        { dimension: "specificity",     observation: "Included tool and task correctly",     impact: +2 },
+        { dimension: "cognitive_state", observation: "Noted iteration pattern",              impact: +1 },
+        { dimension: "intent_capture",  observation: "Didn't infer intent behind iteration", impact: -2 },
+        { dimension: "cognitive_state", observation: "Should note focused creative state",   impact: -1 },
+      ]}
     },
     {
       task: "Describe this screen frame for embedding: Slack open with browser showing research articles in background",
-      score: { overall: 0.82, what_worked: "Inferred context switch; cognitive state captured well", what_didnt: "Could note distraction pattern more — missed distraction signal", what_missing: "" }
+      score: { items: [
+        { dimension: "intent_capture",  observation: "Inferred context switch accurately", impact: +3 },
+        { dimension: "cognitive_state", observation: "Identified research mode",           impact: +3 },
+        { dimension: "specificity",     observation: "Distinguished Slack from browser",   impact: +2 },
+        { dimension: "noise_resistance",observation: "Focused on work-relevant signals",   impact: +2 },
+        { dimension: "cognitive_state", observation: "Could note distraction pattern",     impact: -1 },
+      ]}
     },
   ];
 
@@ -256,12 +305,23 @@ async function main() {
 
     agent.addToMemory(r.task, result, r.score);
 
+    // Show two-pass scoring
+    const derived = deriveScore(r.score.items);
+    console.log(`\nTwo-pass scoring:`);
+    console.log(`  Pass 1 — ${r.score.items.length} impact items:`);
+    for (const item of r.score.items) {
+      const sign = item.impact > 0 ? "+" : "";
+      console.log(`    [${item.dimension}] ${sign}${item.impact}: ${item.observation}`);
+    }
+    console.log(`  Pass 2 — deriveScore():`);
+    console.log(`    net_impact=${derived.net_impact}  √items=${Math.sqrt(r.score.items.length).toFixed(2)}  overall=${derived.overall}`);
+
     const status = agent.getStatus();
     console.log(`\nSix Questions after round ${i + 1}:`);
-    console.log(`  Score:       ${status.score.toFixed(2)}`);
-    console.log(`  What worked: ${status.what_worked}`);
-    console.log(`  What didn't: ${status.what_didnt}`);
-    console.log(`  Help needed: ${status.help_needed}`);
+    console.log(`  Score:         ${status.score.toFixed(2)}`);
+    console.log(`  Top positive:  ${status.top_positive}`);
+    console.log(`  Top negative:  ${status.top_negative}`);
+    console.log(`  Help needed:   ${status.help_needed}`);
     console.log();
   }
 }

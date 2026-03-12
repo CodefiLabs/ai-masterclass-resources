@@ -14,6 +14,7 @@ Usage:
 """
 
 import json
+import math
 import os
 import sys
 from datetime import datetime, timezone
@@ -34,28 +35,45 @@ load_dotenv()
 
 @dataclass
 class AgentStatus:
-    agent:        str
-    what:         str   # What are you doing right now?
-    goal:         str   # What's your goal?
-    why:          str   # Why are you doing it?
-    how:          str   # How are you approaching it?
-    score:        float # Last known score (0.0 - 1.0)
+    agent:         str
+    what:          str   # What are you doing right now?
+    goal:          str   # What's your goal?
+    why:           str   # Why are you doing it?
+    how:           str   # How are you approaching it?
+    score:         float # Last known score (0.0 - 1.0)
     # Reinforcement fields — populated after each scored task
-    what_worked:  str = ""   # what's working + strongest parts + what to keep
-    what_didnt:   str = ""   # what's not working + weakest parts + what to change
-    what_missing: str = ""   # what should have been included but wasn't
-    help_needed:  str = ""
-    timestamp:    str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    top_positive:  str = ""   # highest-impact positive observation
+    top_negative:  str = ""   # highest-impact negative observation
+    help_needed:   str = ""
+    timestamp:     str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 @dataclass
 class MemoryEntry:
-    task:         str
-    result:       str
-    score:        float
-    what_worked:  str
-    what_didnt:   str
-    what_missing: str
+    task:          str
+    result:        str
+    score:         float
+    top_positive:  str
+    top_negative:  str
+    impact_items:  list = field(default_factory=list)
+
+
+# ─── Two-Pass Scoring ────────────────────────────────────────────
+# Pass 1 (LLM): itemize observations with +/- impact scores
+# Pass 2 (math): net_impact / √(items) → normalized 0-1 score
+
+def derive_score(items: list[dict]) -> dict:
+    """Pass 2: deterministic math. No LLM involved."""
+    if not items:
+        return {"overall": 0.5, "net_impact": 0, "total_items": 0,
+                "normalized_impact": 0.0, "raw_score": 50.0}
+    net_impact = sum(item["impact"] for item in items)
+    total_items = len(items)
+    normalized_impact = net_impact / math.sqrt(total_items)
+    raw_score = max(0, min(100, 50 + (normalized_impact * 8.0)))
+    overall = round(raw_score / 100, 3)
+    return {"overall": overall, "net_impact": net_impact, "total_items": total_items,
+            "normalized_impact": round(normalized_impact, 3), "raw_score": round(raw_score, 1)}
 
 
 class Agent:
@@ -73,13 +91,12 @@ class Agent:
         self.goal   = goal
 
         # Live state (answers to six questions)
-        self.current_task = "idle"
-        self.reasoning    = ""
-        self.approach     = ""
-        self.last_score   = 0.0
-        self.what_worked  = ""
-        self.what_didnt   = ""
-        self.what_missing = ""
+        self.current_task  = "idle"
+        self.reasoning     = ""
+        self.approach      = ""
+        self.last_score    = 0.0
+        self.top_positive  = ""
+        self.top_negative  = ""
 
         # Rolling memory — last N scored results
         self.memory: list[MemoryEntry] = []
@@ -90,16 +107,15 @@ class Agent:
     def get_status(self) -> AgentStatus:
         """Answer all six questions right now."""
         return AgentStatus(
-            agent        = self.name,
-            what         = self.current_task,
-            goal         = self.goal,
-            why          = self.reasoning,
-            how          = self.approach,
-            score        = self.last_score,
-            what_worked  = self.what_worked,
-            what_didnt   = self.what_didnt,
-            what_missing = self.what_missing,
-            help_needed  = self._assess_help(),
+            agent         = self.name,
+            what          = self.current_task,
+            goal          = self.goal,
+            why           = self.reasoning,
+            how           = self.approach,
+            score         = self.last_score,
+            top_positive  = self.top_positive,
+            top_negative  = self.top_negative,
+            help_needed   = self._assess_help(),
         )
 
     def _assess_help(self) -> str:
@@ -107,22 +123,33 @@ class Agent:
         if self.last_score == 0.0:
             return "No score yet — just getting started"
         if self.last_score < 0.4:
-            return f"Struggling (score {self.last_score:.2f}) — need a different approach for: {self.what_didnt}"
+            return f"Struggling (score {self.last_score:.2f}) — top issue: {self.top_negative}"
         if self.last_score < 0.7:
-            return f"Making progress (score {self.last_score:.2f}) — could improve: {self.what_missing}"
+            return f"Making progress (score {self.last_score:.2f}) — working on: {self.top_negative}"
         return f"Performing well (score {self.last_score:.2f}) — no help needed"
 
     # ── Memory ────────────────────────────────────────────────────
 
     def add_to_memory(self, task: str, result: str, score: dict):
         """Store a scored result. Updates live state for next question answers."""
+        items = score.get("items", [])
+        derived = score.get("derived", derive_score(items))
+
+        # Extract top positive/negative from impact items
+        positives = sorted([i for i in items if i["impact"] > 0],
+                           key=lambda x: x["impact"], reverse=True)
+        negatives = sorted([i for i in items if i["impact"] < 0],
+                           key=lambda x: x["impact"])
+        top_pos = positives[0]["observation"] if positives else ""
+        top_neg = negatives[0]["observation"] if negatives else ""
+
         entry = MemoryEntry(
-            task         = task,
-            result       = result[:400],
-            score        = score.get("overall", 0.0),
-            what_worked  = score.get("what_worked", ""),
-            what_didnt   = score.get("what_didnt", ""),
-            what_missing = score.get("what_missing", ""),
+            task          = task,
+            result        = result[:400],
+            score         = derived.get("overall", 0.5),
+            top_positive  = top_pos,
+            top_negative  = top_neg,
+            impact_items  = items,
         )
         self.memory.append(entry)
         if len(self.memory) > self.memory_limit:
@@ -130,9 +157,8 @@ class Agent:
 
         # Update live state so get_status() reflects latest
         self.last_score   = entry.score
-        self.what_worked  = entry.what_worked
-        self.what_didnt   = entry.what_didnt
-        self.what_missing = entry.what_missing
+        self.top_positive = entry.top_positive
+        self.top_negative = entry.top_negative
 
     def build_system_prompt(self) -> str:
         """
@@ -157,9 +183,8 @@ class Agent:
         history = "\n\n".join([
             f"Task: {m.task[:80]}\n"
             f"Score: {m.score:.2f} | "
-            f"Worked: {m.what_worked} | "
-            f"Didn't: {m.what_didnt} | "
-            f"Missing: {m.what_missing}"
+            f"Best: {m.top_positive} | "
+            f"Worst: {m.top_negative}"
             for m in self.memory[-3:]
         ])
 
@@ -199,33 +224,46 @@ if __name__ == "__main__":
         goal = "Produce embedding descriptions that best capture human work intent from screen frames",
     )
 
-    # Simulate three rounds with increasing scores
+    # Simulate three rounds with increasing scores (two-pass format)
+    # Pass 1: itemized impact observations  |  Pass 2: derive_score() does the math
     rounds = [
         {
             "task": "Describe this screen frame for embedding: Excel spreadsheet open with multiple tabs and a PDF in split screen",
             "score": {
-                "overall": 0.45,
-                "what_worked": "Identified the tools correctly; concise",
-                "what_didnt":  "Too surface-level — missed cognitive state, just listed what's visible",
-                "what_missing":"No mention of what stage of work this represents",
+                "items": [
+                    {"dimension": "intent_capture",   "observation": "Identified tools correctly",        "impact": +1},
+                    {"dimension": "specificity",      "observation": "Concise output",                    "impact": +1},
+                    {"dimension": "intent_capture",   "observation": "Missed cognitive state entirely",   "impact": -3},
+                    {"dimension": "specificity",      "observation": "Just listed what's visible",        "impact": -2},
+                    {"dimension": "noise_resistance", "observation": "No mention of work stage",          "impact": -2},
+                ],
+                # derive_score() → overall ≈ 0.46 (net=-5, √5=2.24, norm=-2.24, raw=32.1)
             }
         },
         {
             "task": "Describe this screen frame for embedding: Figma canvas with a landing page design being iterated on",
             "score": {
-                "overall": 0.68,
-                "what_worked": "Captured the creative design context; included tool and task",
-                "what_didnt":  "Didn't infer enough about the person's intent behind the iteration",
-                "what_missing":"Should note this is a focused creative/refinement state",
+                "items": [
+                    {"dimension": "intent_capture",    "observation": "Captured creative design context",  "impact": +3},
+                    {"dimension": "specificity",       "observation": "Included tool and task correctly",  "impact": +2},
+                    {"dimension": "cognitive_state",   "observation": "Noted iteration pattern",           "impact": +1},
+                    {"dimension": "intent_capture",    "observation": "Didn't infer intent behind iteration", "impact": -2},
+                    {"dimension": "cognitive_state",   "observation": "Should note focused creative state", "impact": -1},
+                ],
+                # derive_score() → overall ≈ 0.61 (net=+3, √5=2.24, norm=1.34, raw=60.7)
             }
         },
         {
             "task": "Describe this screen frame for embedding: Slack open with browser showing research articles in background",
             "score": {
-                "overall": 0.82,
-                "what_worked": "Inferred context switch and research mode; captured cognitive state well",
-                "what_didnt":  "Could note the distraction pattern more explicitly — person may have been pulled off-task",
-                "what_missing":"",
+                "items": [
+                    {"dimension": "intent_capture",    "observation": "Inferred context switch accurately", "impact": +3},
+                    {"dimension": "cognitive_state",   "observation": "Identified research mode",           "impact": +3},
+                    {"dimension": "specificity",       "observation": "Distinguished Slack from browser",   "impact": +2},
+                    {"dimension": "noise_resistance",  "observation": "Focused on work-relevant signals",   "impact": +2},
+                    {"dimension": "cognitive_state",   "observation": "Could note distraction pattern",     "impact": -1},
+                ],
+                # derive_score() → overall ≈ 0.82 (net=+9, √5=2.24, norm=4.02, raw=82.2)
             }
         },
     ]
@@ -248,10 +286,21 @@ if __name__ == "__main__":
 
         agent.add_to_memory(round_data["task"], result, round_data["score"])
 
+        # Show the two-pass scoring
+        items = round_data["score"]["items"]
+        derived = derive_score(items)
+        print(f"\nTwo-pass scoring:")
+        print(f"  Pass 1 — {len(items)} impact items:")
+        for item in items:
+            sign = "+" if item["impact"] > 0 else ""
+            print(f"    [{item['dimension']}] {sign}{item['impact']}: {item['observation']}")
+        print(f"  Pass 2 — derive_score():")
+        print(f"    net_impact={derived['net_impact']}  √items={math.sqrt(len(items)):.2f}  overall={derived['overall']}")
+
         status = agent.get_status()
         print(f"\nSix Questions after round {i}:")
-        print(f"  Score:        {status.score:.2f}")
-        print(f"  What worked:  {status.what_worked}")
-        print(f"  What didn't:  {status.what_didnt}")
-        print(f"  Help needed:  {status.help_needed}")
+        print(f"  Score:         {status.score:.2f}")
+        print(f"  Top positive:  {status.top_positive}")
+        print(f"  Top negative:  {status.top_negative}")
+        print(f"  Help needed:   {status.help_needed}")
         print()

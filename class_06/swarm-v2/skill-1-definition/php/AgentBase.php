@@ -36,11 +36,10 @@ class AgentStatus
         public readonly string $why,
         public readonly string $how,
         public readonly float  $score,
-        public readonly string $whatWorked  = "",  // what's working + strongest parts
-        public readonly string $whatDidnt   = "",  // what's not working + weakest parts
-        public readonly string $whatMissing = "",  // what should have been included
-        public readonly string $helpNeeded  = "",
-        public readonly string $timestamp   = "",
+        public readonly string $topPositive  = "",  // highest-impact positive observation
+        public readonly string $topNegative  = "",  // highest-impact negative observation
+        public readonly string $helpNeeded   = "",
+        public readonly string $timestamp    = "",
     ) {}
 
     public function toArray(): array
@@ -55,10 +54,34 @@ class MemoryEntry
         public readonly string $task,
         public readonly string $result,
         public readonly float  $score,
-        public readonly string $whatWorked,
-        public readonly string $whatDidnt,
-        public readonly string $whatMissing,
+        public readonly string $topPositive,
+        public readonly string $topNegative,
+        public readonly array  $impactItems = [],
     ) {}
+}
+
+// ── Two-Pass Scoring ─────────────────────────────────────────────
+// Pass 1 (LLM): itemize observations with +/- impact scores
+// Pass 2 (math): net_impact / √(items) → normalized 0-1 score
+
+function deriveScore(array $items): array
+{
+    if (empty($items)) {
+        return ['overall' => 0.5, 'net_impact' => 0, 'total_items' => 0,
+                'normalized_impact' => 0.0, 'raw_score' => 50.0];
+    }
+    $netImpact = array_sum(array_column($items, 'impact'));
+    $totalItems = count($items);
+    $normalizedImpact = $netImpact / sqrt($totalItems);
+    $rawScore = max(0, min(100, 50 + ($normalizedImpact * 8.0)));
+    $overall = round($rawScore / 100, 3);
+    return [
+        'overall'            => $overall,
+        'net_impact'         => $netImpact,
+        'total_items'        => $totalItems,
+        'normalized_impact'  => round($normalizedImpact, 3),
+        'raw_score'          => round($rawScore, 1),
+    ];
 }
 
 // ── Base Agent ────────────────────────────────────────────────────
@@ -77,9 +100,8 @@ abstract class AgentBase
     protected string $reasoning    = '';
     protected string $approach     = '';
     protected float  $lastScore    = 0.0;
-    protected string $whatWorked   = '';
-    protected string $whatDidnt    = '';
-    protected string $whatMissing  = '';
+    protected string $topPositive  = '';
+    protected string $topNegative  = '';
 
     public function __construct(
         protected string $name,
@@ -102,25 +124,24 @@ abstract class AgentBase
     public function getStatus(): AgentStatus
     {
         return new AgentStatus(
-            agent:       $this->name,
-            what:        $this->currentTask,
-            goal:        $this->goal,
-            why:         $this->reasoning,
-            how:         $this->approach,
-            score:       $this->lastScore,
-            whatWorked:  $this->whatWorked,
-            whatDidnt:   $this->whatDidnt,
-            whatMissing: $this->whatMissing,
-            helpNeeded:  $this->assessHelp(),
-            timestamp:   now()->toIso8601String(),
+            agent:        $this->name,
+            what:         $this->currentTask,
+            goal:         $this->goal,
+            why:          $this->reasoning,
+            how:          $this->approach,
+            score:        $this->lastScore,
+            topPositive:  $this->topPositive,
+            topNegative:  $this->topNegative,
+            helpNeeded:   $this->assessHelp(),
+            timestamp:    now()->toIso8601String(),
         );
     }
 
     private function assessHelp(): string
     {
         if ($this->lastScore === 0.0) return 'No score yet — just getting started';
-        if ($this->lastScore < 0.4)  return "Struggling ({$this->lastScore}) — need different approach for: {$this->whatDidnt}";
-        if ($this->lastScore < 0.7)  return "Progress ({$this->lastScore}) — could improve: {$this->whatMissing}";
+        if ($this->lastScore < 0.4)  return "Struggling ({$this->lastScore}) — top issue: {$this->topNegative}";
+        if ($this->lastScore < 0.7)  return "Progress ({$this->lastScore}) — working on: {$this->topNegative}";
         return "Performing well ({$this->lastScore}) — no help needed";
     }
 
@@ -128,13 +149,24 @@ abstract class AgentBase
 
     public function addToMemory(string $task, string $result, array $score): void
     {
+        $items = $score['items'] ?? [];
+        $derived = $score['derived'] ?? deriveScore($items);
+
+        // Extract top positive/negative from impact items
+        $positives = array_filter($items, fn($i) => $i['impact'] > 0);
+        $negatives = array_filter($items, fn($i) => $i['impact'] < 0);
+        usort($positives, fn($a, $b) => $b['impact'] <=> $a['impact']);
+        usort($negatives, fn($a, $b) => $a['impact'] <=> $b['impact']);
+        $topPos = !empty($positives) ? reset($positives)['observation'] : '';
+        $topNeg = !empty($negatives) ? reset($negatives)['observation'] : '';
+
         $entry = new MemoryEntry(
-            task:        $task,
-            result:      substr($result, 0, 400),
-            score:       $score['overall']      ?? 0.0,
-            whatWorked:  $score['what_worked']  ?? '',
-            whatDidnt:   $score['what_didnt']   ?? '',
-            whatMissing: $score['what_missing'] ?? '',
+            task:         $task,
+            result:       substr($result, 0, 400),
+            score:        $derived['overall'] ?? 0.5,
+            topPositive:  $topPos,
+            topNegative:  $topNeg,
+            impactItems:  $items,
         );
 
         $this->memory[] = $entry;
@@ -144,9 +176,8 @@ abstract class AgentBase
 
         // Update live state
         $this->lastScore   = $entry->score;
-        $this->whatWorked  = $entry->whatWorked;
-        $this->whatDidnt   = $entry->whatDidnt;
-        $this->whatMissing = $entry->whatMissing;
+        $this->topPositive = $entry->topPositive;
+        $this->topNegative = $entry->topNegative;
     }
 
     public function buildSystemPrompt(): string
@@ -170,7 +201,7 @@ abstract class AgentBase
         $recent = array_slice($this->memory, -3);
         $history = implode("\n\n", array_map(fn(MemoryEntry $m) =>
             "Task: " . substr($m->task, 0, 80) . "\n" .
-            "Score: {$m->score} | Worked: {$m->whatWorked} | Didn't: {$m->whatDidnt} | Missing: {$m->whatMissing}",
+            "Score: {$m->score} | Best: {$m->topPositive} | Worst: {$m->topNegative}",
             $recent
         ));
 
