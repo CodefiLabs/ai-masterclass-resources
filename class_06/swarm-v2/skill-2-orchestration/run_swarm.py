@@ -302,8 +302,7 @@ class EmbedderAgent(Agent):
             f"Your approach should capture: intent, cognitive state, work stage, tool context.\n\n"
             f"APPROACH: [describe your embedding strategy]\n"
             f"EMBEDDING_TEXT: [the actual text you would embed — max 150 words]\n"
-            f"REASONING: [why this approach will produce better vector representations]\n"
-            f"CONFIDENCE: [0.0-1.0]"
+            f"REASONING: [why this approach will produce better vector representations]"
         )
 
         await self.publish(
@@ -339,8 +338,11 @@ class ApproachTesterAgent(Agent):
         self.current_task = "Scoring approach (two-pass)"
 
         # Pass 1: Itemize observations (LLM call)
-        items_response = self.ask(
-            ITEMIZE_PROMPT.format(frame=source, approach=approach_txt)
+        # Needs more tokens than the default 512 — 8-20 items × ~30 tokens each
+        items_response = ollama.chat(
+            prompt=ITEMIZE_PROMPT.format(frame=source, approach=approach_txt),
+            system=self.build_prompt(),
+            max_tokens=1024,
         )
 
         try:
