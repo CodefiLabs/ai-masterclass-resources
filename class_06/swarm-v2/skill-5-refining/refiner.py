@@ -88,7 +88,8 @@ class RefinerAgent:
                             self.score_buffer = []
 
     async def _refine(self):
-        """Analyze N scores worth of impact items, find patterns, propose a better approach."""
+        """Analyze N scores worth of impact items, find patterns, propose a better approach.
+        Also proposes adjustments to capture parameters (interval, batch window, max frames)."""
         print(f"\n[refiner] Running refinement on {len(self.score_buffer)} scores...")
 
         # Collect all impact items across buffered scores
@@ -134,6 +135,7 @@ class RefinerAgent:
 
         history_summary = "\n".join(summary_parts)
 
+        # ── Step 1: Propose refined embedding approach ──
         refined = ollama.chat(
             prompt=(
                 f"Here is the impact analysis from the last {len(self.score_buffer)} embedding attempts:\n\n"
@@ -172,6 +174,68 @@ class RefinerAgent:
         print(f"  Avg score was: {avg_score:.2f}")
         print(f"  Items analyzed: {len(all_items)}")
         print(f"  Approach preview: {refined[:200]}...")
+
+        # ── Step 2: Propose capture parameter adjustments ──
+        await self._adjust_capture_config(avg_score, all_items, history_summary)
+
+    async def _adjust_capture_config(self, avg_score: float, all_items: list, history_summary: str):
+        """Use LLM to propose adjustments to capture parameters based on scoring patterns."""
+        # Read current config
+        current_config = {"capture_interval": 2, "batch_window": 30, "max_frames_per_batch": 15}
+        try:
+            raw = await self.redis.get("swarm:capture_config")
+            if raw:
+                current_config = json.loads(raw)
+        except Exception:
+            pass
+
+        config_response = ollama.chat(
+            prompt=(
+                f"Current capture configuration:\n"
+                f"  capture_interval: {current_config.get('capture_interval', 2)} seconds (range: 1-5)\n"
+                f"  batch_window: {current_config.get('batch_window', 30)} seconds (range: 15-60)\n"
+                f"  max_frames_per_batch: {current_config.get('max_frames_per_batch', 15)} (range: 5-30)\n\n"
+                f"Average score from last batch: {avg_score:.2f}\n"
+                f"Total impact items: {len(all_items)}\n\n"
+                f"Scoring pattern summary:\n{history_summary}\n\n"
+                f"Based on the scoring patterns, recommend adjustments to capture parameters.\n\n"
+                f"Trade-offs to consider:\n"
+                f"- More frequent captures (lower interval) = more data but more noise and processing load\n"
+                f"- Less frequent captures (higher interval) = cleaner frames but might miss transitions\n"
+                f"- Larger batch windows = more context for understanding activity arcs, but slower feedback loop\n"
+                f"- Smaller batch windows = faster iteration but less context per analysis\n"
+                f"- More frames per batch = richer picture but longer LLM processing time\n"
+                f"- Fewer frames per batch = faster processing but might miss key moments\n\n"
+                f"Return ONLY valid JSON with your recommended values:\n"
+                f'{{"capture_interval": <1-5>, "batch_window": <15-60>, "max_frames_per_batch": <5-30>}}'
+            ),
+            system=(
+                "You are a systems tuner for a screen capture pipeline. "
+                "You adjust capture parameters based on scoring evidence. "
+                "If scores are high (>0.7), make conservative changes. "
+                "If scores are low (<0.5), try more aggressive adjustments. "
+                "If specificity scores are low, consider more frequent captures. "
+                "If noise_resistance scores are low, consider less frequent captures. "
+                "Return ONLY the JSON object, no other text."
+            ),
+            max_tokens=128,
+        )
+
+        try:
+            clean = config_response.strip().strip("```json").strip("```").strip()
+            new_config = json.loads(clean)
+            # Clamp values to valid ranges
+            new_config["capture_interval"] = max(1, min(5, int(new_config.get("capture_interval", 2))))
+            new_config["batch_window"] = max(15, min(60, int(new_config.get("batch_window", 30))))
+            new_config["max_frames_per_batch"] = max(5, min(30, int(new_config.get("max_frames_per_batch", 15))))
+
+            await self.redis.set("swarm:capture_config", json.dumps(new_config))
+
+            print(f"[refiner] Capture config updated: interval={new_config['capture_interval']}s, "
+                  f"window={new_config['batch_window']}s, max_frames={new_config['max_frames_per_batch']}")
+        except Exception as e:
+            print(f"[refiner] Failed to parse capture config response, keeping current: {e}")
+            print(f"  Raw response: {config_response[:200]}")
 
 
 # ─── Read current approach (used by embedder agents) ─────────────
@@ -239,6 +303,7 @@ async def simulate():
     agent.score_buffer = SIMULATED_SCORES
     class MockRedis:
         async def set(self, *a, **k): pass
+        async def get(self, *a, **k): return None
         async def xadd(self, *a, **k): pass
     agent.redis = MockRedis()
     await agent._refine()

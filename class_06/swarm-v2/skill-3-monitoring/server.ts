@@ -31,15 +31,28 @@ app.use(cors());
 
 // ── Types ──────────────────────────────────────────────────────────
 
-type EventKind = "frame" | "approach" | "score" | "heartbeat";
+type EventKind = "frame" | "frame_batch" | "approach" | "score" | "heartbeat";
+
+interface BatchFrame {
+  description: string;
+  image_b64?: string;
+  has_image?: boolean;
+  captured_at?: string;
+}
 
 interface FeedEvent {
   id:        string;
   ts:        string;
   kind:      EventKind;
   agent:     string;
-  // frame
+  // frame (single — legacy)
   frame_description?: string;
+  // frame_batch
+  batch?: boolean;
+  frame_count?: number;
+  frames?: BatchFrame[];
+  window_seconds?: number;
+  capture_interval?: number;
   // approach
   source_description?: string;
   approach_text?: string;
@@ -96,16 +109,38 @@ async function startWatching(redis: RedisClientType) {
     } catch { /* exists */ }
   }
 
-  // screen:frames
+  // screen:frames (handles both single frames and batches)
   watchStream(redis, "screen:frames", "monitor", "mon-frames", (msg) => {
     const p = msg.payload as any;
-    pushEvent({
-      id:                msg.id as string ?? crypto.randomUUID(),
-      ts:                msg.timestamp as string,
-      kind:              "frame",
-      agent:             msg.from as string,
-      frame_description: p?.description ?? "",
-    });
+    if (p?.batch) {
+      // Batch of frames
+      const frames: BatchFrame[] = (p.frames || []).map((f: any) => ({
+        description: f?.description ?? "",
+        image_b64: f?.image_b64 ?? "",
+        has_image: f?.has_image ?? false,
+        captured_at: f?.captured_at ?? "",
+      }));
+      pushEvent({
+        id:               msg.id as string ?? crypto.randomUUID(),
+        ts:               msg.timestamp as string,
+        kind:             "frame_batch",
+        agent:            msg.from as string,
+        batch:            true,
+        frame_count:      p.frame_count ?? frames.length,
+        frames:           frames,
+        window_seconds:   p.window_seconds ?? 30,
+        capture_interval: p.capture_interval ?? 2,
+      });
+    } else {
+      // Legacy single frame
+      pushEvent({
+        id:                msg.id as string ?? crypto.randomUUID(),
+        ts:                msg.timestamp as string,
+        kind:              "frame",
+        agent:             msg.from as string,
+        frame_description: p?.description ?? "",
+      });
+    }
   });
 
   // screen:approaches
@@ -347,6 +382,11 @@ header h1{color:#58a6ff;font-size:15px;white-space:nowrap}
 const DIM_COLORS = {intent_capture:"#58a6ff",cognitive_state:"#bc8cff",specificity:"#3fb950",noise_resistance:"#e3b341"};
 let lastEventId = null;
 
+function esc(s) {
+  if (!s) return "";
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+
 function reltime(ts) {
   const s = Math.round((Date.now() - new Date(ts).getTime()) / 1000);
   if (s < 5)  return "just now";
@@ -372,14 +412,14 @@ function renderAgents(agents) {
         '<div class="agent-name" style="color:' + agentColor(name) + '">' + name + '</div>' +
         '<span class="badge ' + a.status + '">' + a.status + '</span>' +
       '</div>' +
-      '<div class="agent-task">' + (a.task || "idle") + '</div>' +
+      '<div class="agent-task">' + esc(a.task || "idle") + '</div>' +
       '<div class="agent-score"><div class="agent-score-fill" style="width:' + pct + '%"></div></div>' +
       '<div style="display:flex;justify-content:space-between">' +
         '<span class="' + (a.help_needed === "ok" ? "ok" : "struggling") + '">' + (a.help_needed || "—") + '</span>' +
         '<span style="font-size:9px;color:#484f58">' + reltime(a.last_seen) + '</span>' +
       '</div>' +
-      (a.top_positive ? '<div style="font-size:9px;color:#3fb950;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">+ ' + a.top_positive + '</div>' : '') +
-      (a.top_negative ? '<div style="font-size:9px;color:#f85149;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">− ' + a.top_negative + '</div>' : '') +
+      (a.top_positive ? '<div style="font-size:9px;color:#3fb950;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">+ ' + esc(a.top_positive) + '</div>' : '') +
+      (a.top_negative ? '<div style="font-size:9px;color:#f85149;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">− ' + esc(a.top_negative) + '</div>' : '') +
     '</div>';
   }).join("");
 }
@@ -420,16 +460,35 @@ function renderEvent(ev) {
   let typeCls = "event-type type-" + ev.kind;
   let body = "";
 
+  if (ev.kind === "frame_batch") {
+    cls = "event event-frame";
+    typeCls = "event-type type-frame";
+    const frames = ev.frames || [];
+    const count = ev.frame_count || frames.length;
+    const window = ev.window_seconds || 30;
+    const interval = ev.capture_interval || 2;
+    body = '<div style="margin-bottom:6px;font-size:11px;color:#58a6ff;font-weight:bold">' +
+           count + ' frames over ' + window + 's (every ' + interval + 's)</div>' +
+           '<div style="display:flex;flex-direction:column;gap:3px">' +
+           frames.map(function(f, i) {
+             return '<div style="font-size:10px;color:#c9d1d9;padding:2px 6px;background:#0d1117;border-radius:3px;border-left:2px solid #1f6feb">' +
+                    '<span style="color:#484f58;margin-right:6px">[' + (i+1) + '/' + count + ']</span>' +
+                    esc(f.description || "(no description)") +
+                    '</div>';
+           }).join("") +
+           '</div>';
+  }
+
   if (ev.kind === "frame") {
-    body = '<div class="event-body">' + (ev.frame_description || "(no description)") + '</div>';
+    body = '<div class="event-body">' + esc(ev.frame_description || "(no description)") + '</div>';
   }
 
   if (ev.kind === "approach") {
     const txt = ev.approach_text || "";
     body = '<div class="approach-label">source</div>' +
-           '<div style="color:#8b949e;font-size:10px;margin-bottom:4px">' + (ev.source_description || "") + '</div>' +
+           '<div style="color:#8b949e;font-size:10px;margin-bottom:4px">' + esc(ev.source_description || "") + '</div>' +
            (txt
-             ? '<div class="approach-label">proposed approach</div><div class="approach-text">' + txt + '</div>'
+             ? '<div class="approach-label">proposed approach</div><div class="approach-text">' + esc(txt) + '</div>'
              : '<div style="color:#484f58;font-size:10px;font-style:italic">⚠ model returned empty approach</div>');
   }
 
@@ -443,22 +502,22 @@ function renderEvent(ev) {
            '<span style="font-size:10px;color:#8b949e">raw ' + (ev.raw_score||0).toFixed(1) + ' | ' + (ev.total_items||0) + ' items | net ' + (ev.net_impact||0) + '</span>' +
            '</div>';
     if (ev.source_description) {
-      body += '<div style="color:#484f58;font-size:10px;margin-top:3px">' + ev.source_description + '</div>';
+      body += '<div style="color:#484f58;font-size:10px;margin-top:3px">' + esc(ev.source_description) + '</div>';
     }
     const items = ev.items || [];
     if (items.length) {
       const pos = items.filter(i => i.impact > 0).sort((a,b) => b.impact - a.impact).slice(0,3);
       const neg = items.filter(i => i.impact < 0).sort((a,b) => a.impact - b.impact).slice(0,3);
       body += '<div class="items-list">' +
-        pos.map(i => '<div class="item pos"><span class="item-dim">' + i.dimension.replace("_"," ") + '</span><span class="item-obs">' + i.observation + '</span><span class="item-impact">+' + i.impact + '</span></div>').join("") +
-        neg.map(i => '<div class="item neg"><span class="item-dim">' + i.dimension.replace("_"," ") + '</span><span class="item-obs">' + i.observation + '</span><span class="item-impact">' + i.impact + '</span></div>').join("") +
+        pos.map(i => '<div class="item pos"><span class="item-dim">' + esc(i.dimension.replace("_"," ")) + '</span><span class="item-obs">' + esc(i.observation) + '</span><span class="item-impact">+' + i.impact + '</span></div>').join("") +
+        neg.map(i => '<div class="item neg"><span class="item-dim">' + esc(i.dimension.replace("_"," ")) + '</span><span class="item-obs">' + esc(i.observation) + '</span><span class="item-impact">' + i.impact + '</span></div>').join("") +
         '</div>';
     } else {
       body += '<div style="color:#484f58;font-size:10px;margin-top:4px;font-style:italic">⚠ no scored items — model may have returned malformed JSON</div>';
     }
   }
 
-  const label = ev.kind === "frame" ? "FRAME CAPTURED" : ev.kind === "approach" ? "APPROACH PROPOSED" : "SCORED";
+  const label = ev.kind === "frame_batch" ? "BATCH CAPTURED" : ev.kind === "frame" ? "FRAME CAPTURED" : ev.kind === "approach" ? "APPROACH PROPOSED" : "SCORED";
   const ts = ev.ts ? reltime(ev.ts) : "";
 
   return '<div class="' + cls + '">' +
@@ -514,7 +573,7 @@ async function main() {
   const redis = createClient({ url: REDIS }) as RedisClientType;
   await redis.connect();
   console.log("[monitor] Connected to Redis");
-  startWatching(redis);
+  await startWatching(redis);
   app.listen(PORT, () => {
     console.log(`\n🟢  Monitor running → http://localhost:${PORT}`);
     console.log(`    Feed         → http://localhost:${PORT}/feed`);
