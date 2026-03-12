@@ -1,0 +1,25 @@
+{
+  "streams": {
+    "FRAMES":     "screen:frames",
+    "APPROACHES": "screen:approaches",
+    "RESULTS":    "screen:results",
+    "SCORES":     "agent:scores",
+    "HEALTH":     "agent:health",
+    "HELP":       "agent:help"
+  },
+  "groups": {
+    "EMBEDDERS":  "embedders",
+    "SCORERS":    "scorers",
+    "REFINERS":   "refiners",
+    "MONITORS":   "monitors"
+  },
+  "message_types": [
+    "frame",
+    "approach_proposal",
+    "embedding_result",
+    "score",
+    "help_request",
+    "help_response",
+    "heartbeat"
+  ]
+}

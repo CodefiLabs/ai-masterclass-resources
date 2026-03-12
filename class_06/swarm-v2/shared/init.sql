@@ -1,0 +1,4 @@
+-- This file is no longer used.
+-- pgvector has been replaced by Hindsight (vectorize-io/hindsight).
+-- Hindsight manages its own storage internally.
+-- See docker-compose.yml for the Hindsight service configuration.
