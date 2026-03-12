@@ -49,10 +49,11 @@ def chat(
     response = requests.post(
         f"{OLLAMA_BASE_URL}/api/chat",
         json={
-            "model":   model,
+            "model":    model,
             "messages": messages,
-            "stream":  False,
-            "options": {"num_predict": max_tokens},
+            "stream":   False,
+            "think":    False,   # disable thinking mode on qwen3.x/deepseek-r1 models
+            "options":  {"num_predict": max_tokens},
         },
         timeout=120,
     )

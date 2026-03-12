@@ -67,11 +67,15 @@ Every agent must be able to answer these at any moment:
 
 | Layer | Tool | Why |
 |-------|------|-----|
-| Agents | Ollama (qwen3.5:latest) | Local LLM does the reasoning |
+| Agents | Ollama (qwen3.5:2b) | Local LLM does the reasoning — 2b is fast enough; larger models hit timeout |
 | Message bus | Redis Streams | Fast, persistent, consumer groups |
 | Memory | Hindsight (vectorize-io) | Auto-embeds, stores, and retrieves memories |
 | Monitoring | Redis XLEN + Express API | See queue depth and scores |
 | PHP layer | Laravel Queue + Predis | Real parity, not stubs |
+
+> **Model note:** `qwen3.5:latest` (the 7b) is a thinking model — its reasoning tokens count against `num_predict`.
+> At ~1s/token it reliably exceeds the 120s timeout in `shared/ollama.py`. Use `qwen3.5:2b` instead.
+> If you want to run the larger model, bump `timeout=120` to `timeout=600` in `shared/ollama.py`.
 
 ---
 
@@ -80,22 +84,35 @@ Every agent must be able to answer these at any moment:
 ```bash
 # 0. Prerequisites — Ollama must be running with the model pulled
 ollama serve
-ollama pull qwen3.5:latest
+ollama pull qwen3.5:2b
 
 # 1. Start infrastructure (Redis + Hindsight)
 docker compose up -d
 
-# 2. Python agents (the core)
-cd skill-1-definition/python
-cp .env.example .env
-pip install -r requirements.txt
-python agent.py
+# 2. Create a shared Python virtualenv (system pip is externally managed on macOS)
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r skill-1-definition/python/requirements.txt \
+            -r skill-2-orchestration/requirements.txt \
+            -r skill-4-eval/requirements.txt \
+            -r skill-5-refining/requirements.txt \
+            -r screen-pipeline/requirements.txt
 
-# 3. Run the full swarm
-cd ../../skill-2-orchestration
-python run_swarm.py --mode demo
+# 3. Copy env files (defaults point to localhost Ollama + Redis)
+for dir in skill-1-definition/python skill-2-orchestration skill-4-eval skill-5-refining screen-pipeline; do
+  cp $dir/.env.example $dir/.env
+done
 
-# 4. Watch it
-open http://localhost:3000         # monitoring dashboard
+# 4. Run the full swarm (from repo root, venv active)
+PYTHONUNBUFFERED=1 .venv/bin/python3 skill-2-orchestration/run_swarm.py --mode demo
+
+# 5. Watch it
+#   monitoring dashboard runs on port 3001 to avoid conflicts (port 3000 is commonly taken)
+cd skill-3-monitoring && npm install && PORT=3001 npx tsx server.ts &
+open http://localhost:3001         # monitoring dashboard
 open http://localhost:9999         # Hindsight admin UI
+open http://localhost:8001         # RedisInsight UI
 ```
+
+> **Note:** The monitoring server listens on port 3000 by default but port 3000 is frequently
+> used by other local dev servers. Use `PORT=3001` (or any free port) to avoid conflicts.
