@@ -116,7 +116,7 @@ def derive_score(items: list[dict]) -> dict:
             "raw_score": 50.0,
         }
 
-    net_impact = sum(item["impact"] for item in items)
+    net_impact = sum(item.get("impact", 0) for item in items)
     total_items = len(items)
     normalized_impact = net_impact / math.sqrt(total_items)
 
